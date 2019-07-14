@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,11 @@ import (
 )
 
 var authURL = "https://www.googleapis.com/auth/spreadsheets"
+
+var (
+	commit  = flag.Bool("commit", false, "If set, send results to spreadsheet")
+	verbose = flag.Bool("verbose", false, "If set, turns on debug-level logging")
+)
 
 func getClient(config *oauth2.Config) *http.Client {
 	// the file token.json stores access and refresh tokens.
@@ -108,6 +115,15 @@ func getStravaData(stravaToken string, client *http.Client) *stravaResponse {
 	return activities
 }
 
+func getDuration(timeSec int16) time.Duration {
+	timeStr := fmt.Sprintf("%ds", timeSec)
+	duration, err := time.ParseDuration(timeStr)
+	if err != nil {
+		log.Print(err)
+	}
+	return duration
+}
+
 func filterActivitiesForDay(date time.Time, activities []stravaActivity) []stravaActivity {
 	var result []stravaActivity
 	loc, _ := time.LoadLocation("America/New_York")
@@ -123,16 +139,26 @@ func filterActivitiesForDay(date time.Time, activities []stravaActivity) []strav
 	return result
 }
 
+func calculateAvgPace(timeSec float64, mileage float64) string {
+	return strconv.FormatFloat((timeSec/60)/mileage, 'f', 2, 64)
+}
+
+// Iterate through a list of activities and create the ValueRange struct
+// needed for the call to Append
 // TODO: figure out if this is actually the best way to create a 2d array in Go
-func getSpreadsheetValueFromActivity(activity *stravaActivity, updateRange string) *sheets.ValueRange {
-	// calculate the mileage from the distance in meters
-	mileage := activity.DistanceM / 1600
-	row := make([]interface{}, 2)
-	formattedDate := strings.Split(activity.StartTime, "T")[0]
-	row[0] = formattedDate
-	row[1] = mileage
-	rows := make([][]interface{}, 1)
-	rows[0] = row
+func getSpreadsheetValuesFromActivities(activities *[]stravaActivity, updateRange string) *sheets.ValueRange {
+	rows := make([][]interface{}, len(*activities))
+	for i, activity := range *activities {
+		mileage := activity.DistanceM / 1600
+		row := make([]interface{}, 4)
+		formattedDate := strings.Split(activity.StartTime, "T")[0]
+		row[0] = formattedDate
+		row[1] = mileage
+		duration := getDuration(activity.MovingTimeSec)
+		row[2] = duration.String()
+		row[3] = calculateAvgPace(duration.Seconds(), mileage)
+		rows[i] = row
+	}
 	return &sheets.ValueRange{
 		MajorDimension: "ROWS",
 		Range:          updateRange,
@@ -141,7 +167,11 @@ func getSpreadsheetValueFromActivity(activity *stravaActivity, updateRange strin
 }
 
 func main() {
+	flag.Parse()
 	log.SetFormatter(&log.JSONFormatter{})
+	if *verbose {
+		log.SetLevel(log.DebugLevel)
+	}
 	// some auth stuff that I apparently didn't get right the first time because
 	// I didn't get write the first time (I got read-only, apparently)
 	b, err := ioutil.ReadFile(os.Getenv("SHEETS_CREDENTIALS"))
@@ -164,6 +194,7 @@ func main() {
 	stravaToken := os.Getenv("STRAVA_ACCESS_TOKEN")
 	httpClient := &http.Client{}
 	activities := getStravaData(stravaToken, httpClient)
+	log.Debug(activities)
 
 	// we should really be getting at most one activity per day for strava
 	todaysActivities := filterActivitiesForDay(time.Now(), *activities)
@@ -176,18 +207,25 @@ func main() {
 		log.Fatalf("Ambiguous number of activities: %v\n", len(todaysActivities))
 	}
 
+	log.Debug(todaysActivities)
+
 	// Read data from the raw "runs" sheet
 	spreadsheetID := os.Getenv("SHEET_ID")
 	readRange := "runs!A1:B"
 
 	// Try to post that activity to the spreadsheet
 	activity := todaysActivities[0]
-	log.Debug(activity)
-	value := getSpreadsheetValueFromActivity(&activity, readRange)
-	appendCall := srv.Spreadsheets.Values.Append(spreadsheetID, readRange, value).ValueInputOption("USER_ENTERED")
-	appendResp, err := appendCall.Do()
-	log.Debug("append resp: %v\n", appendResp)
-	if err != nil {
-		log.Fatalf("Error appending to spreadsheet: %v", err)
+	log.Info(activity)
+	values := getSpreadsheetValuesFromActivities(&todaysActivities, readRange)
+	log.WithFields(log.Fields{
+		"append values": values,
+	}).Info("Appending the following values")
+	if *commit {
+		appendCall := srv.Spreadsheets.Values.Append(spreadsheetID, readRange, values).ValueInputOption("USER_ENTERED")
+		appendResp, err := appendCall.Do()
+		log.Debug("append resp: %v\n", appendResp)
+		if err != nil {
+			log.Fatalf("Error appending to spreadsheet: %v", err)
+		}
 	}
 }
