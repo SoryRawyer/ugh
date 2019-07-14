@@ -5,18 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/sheets/v4"
 )
 
-var authURL = "https://www.googleapis.com/auth/spreadsheets.readonly"
+var authURL = "https://www.googleapis.com/auth/spreadsheets"
 
 func getClient(config *oauth2.Config) *http.Client {
 	// the file token.json stores access and refresh tokens.
@@ -140,6 +141,7 @@ func getSpreadsheetValueFromActivity(activity *stravaActivity, updateRange strin
 }
 
 func main() {
+	log.SetFormatter(&log.JSONFormatter{})
 	// some auth stuff that I apparently didn't get right the first time because
 	// I didn't get write the first time (I got read-only, apparently)
 	b, err := ioutil.ReadFile(os.Getenv("SHEETS_CREDENTIALS"))
@@ -158,22 +160,6 @@ func main() {
 		log.Fatalf("Unable to get sheets client: %v\n", err)
 	}
 
-	// Read data from the raw "runs" sheet
-	spreadsheetID := os.Getenv("SHEET_ID")
-	readRange := "runs!A1:B"
-	resp, err := srv.Spreadsheets.Values.Get(spreadsheetID, readRange).Do()
-	if err != nil {
-		log.Fatalf("Unable to retrieve data from spreadseet: %v\n", err)
-	}
-
-	if len(resp.Values) == 0 {
-		fmt.Println("No data found")
-	} else {
-		for _, row := range resp.Values {
-			fmt.Println(row)
-		}
-	}
-
 	// get activities from Strava and filter to get todays activity
 	stravaToken := os.Getenv("STRAVA_ACCESS_TOKEN")
 	httpClient := &http.Client{}
@@ -190,11 +176,18 @@ func main() {
 		log.Fatalf("Ambiguous number of activities: %v\n", len(todaysActivities))
 	}
 
+	// Read data from the raw "runs" sheet
+	spreadsheetID := os.Getenv("SHEET_ID")
+	readRange := "runs!A1:B"
+
 	// Try to post that activity to the spreadsheet
 	activity := todaysActivities[0]
+	log.Debug(activity)
 	value := getSpreadsheetValueFromActivity(&activity, readRange)
-	appendCall := srv.Spreadsheets.Values.Append(spreadsheetID, readRange, value)
+	appendCall := srv.Spreadsheets.Values.Append(spreadsheetID, readRange, value).ValueInputOption("USER_ENTERED")
 	appendResp, err := appendCall.Do()
-	fmt.Printf("append resp: %v\n", appendResp)
-	fmt.Printf("err: %v\n", err)
+	log.Debug("append resp: %v\n", appendResp)
+	if err != nil {
+		log.Fatalf("Error appending to spreadsheet: %v", err)
+	}
 }
