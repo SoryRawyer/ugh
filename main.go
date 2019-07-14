@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -76,6 +77,8 @@ type stravaActivity struct {
 	Name          string  `json:"name"`
 	DurationSec   int16   `json:"duration"`
 	MovingTimeSec int16   `json:"moving_time"`
+
+	startDate *time.Time
 }
 
 type stravaResponse []stravaActivity
@@ -109,19 +112,36 @@ func filterActivitiesForDay(date time.Time, activities []stravaActivity) []strav
 	loc, _ := time.LoadLocation("America/New_York")
 	for _, activity := range activities {
 		activityDate, _ := time.ParseInLocation(time.RFC3339, activity.StartTime, loc)
-		fmt.Println(activity.StartTime)
-		fmt.Println(activityDate)
-		fmt.Println(date)
 		if activityDate.Day() == date.Day() &&
 			activityDate.Month() == date.Month() &&
 			activityDate.Year() == date.Year() {
+			activity.startDate = &activityDate
 			result = append(result, activity)
 		}
 	}
 	return result
 }
 
+// TODO: figure out if this is actually the best way to create a 2d array in Go
+func getSpreadsheetValueFromActivity(activity *stravaActivity, updateRange string) *sheets.ValueRange {
+	// calculate the mileage from the distance in meters
+	mileage := activity.DistanceM / 1600
+	row := make([]interface{}, 2)
+	formattedDate := strings.Split(activity.StartTime, "T")[0]
+	row[0] = formattedDate
+	row[1] = mileage
+	rows := make([][]interface{}, 1)
+	rows[0] = row
+	return &sheets.ValueRange{
+		MajorDimension: "ROWS",
+		Range:          updateRange,
+		Values:         rows,
+	}
+}
+
 func main() {
+	// some auth stuff that I apparently didn't get right the first time because
+	// I didn't get write the first time (I got read-only, apparently)
 	b, err := ioutil.ReadFile(os.Getenv("SHEETS_CREDENTIALS"))
 	if err != nil {
 		log.Fatalf("couldn't read the credential file, man: %v", err)
@@ -138,8 +158,9 @@ func main() {
 		log.Fatalf("Unable to get sheets client: %v\n", err)
 	}
 
+	// Read data from the raw "runs" sheet
 	spreadsheetID := os.Getenv("SHEET_ID")
-	readRange := "plan!D1:D12"
+	readRange := "runs!A1:B"
 	resp, err := srv.Spreadsheets.Values.Get(spreadsheetID, readRange).Do()
 	if err != nil {
 		log.Fatalf("Unable to retrieve data from spreadseet: %v\n", err)
@@ -153,10 +174,12 @@ func main() {
 		}
 	}
 
+	// get activities from Strava and filter to get todays activity
 	stravaToken := os.Getenv("STRAVA_ACCESS_TOKEN")
 	httpClient := &http.Client{}
 	activities := getStravaData(stravaToken, httpClient)
-	fmt.Println(activities)
+
+	// we should really be getting at most one activity per day for strava
 	todaysActivities := filterActivitiesForDay(time.Now(), *activities)
 	if len(todaysActivities) == 0 {
 		log.Print("No activities today!")
@@ -167,6 +190,11 @@ func main() {
 		log.Fatalf("Ambiguous number of activities: %v\n", len(todaysActivities))
 	}
 
+	// Try to post that activity to the spreadsheet
 	activity := todaysActivities[0]
-	fmt.Println(activity)
+	value := getSpreadsheetValueFromActivity(&activity, readRange)
+	appendCall := srv.Spreadsheets.Values.Append(spreadsheetID, readRange, value)
+	appendResp, err := appendCall.Do()
+	fmt.Printf("append resp: %v\n", appendResp)
+	fmt.Printf("err: %v\n", err)
 }
